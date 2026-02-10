@@ -131,10 +131,21 @@ def convert_to_shapefile(doc: dict, output_path: Path) -> int:
     return count
 
 
+def _detect_direction(filename: str) -> str:
+    """Derive 'incoming', 'outgoing', or 'unknown' from the filename."""
+    lower = filename.lower()
+    if "_incoming_" in lower or lower.startswith("incoming"):
+        return "incoming"
+    if "_outgoing_" in lower or lower.startswith("outgoing"):
+        return "outgoing"
+    return "unknown"
+
+
 def append_to_writer(
     w: shapefile.Writer,
     doc: dict,
     source_name: str,
+    direction: str,
     attr_fields: list[tuple[str, int, tuple]],
 ) -> int:
     """Append all features from one document to a shared Writer.
@@ -164,6 +175,7 @@ def append_to_writer(
             else:
                 rec.append(None)
         rec.append(source_name)
+        rec.append(direction)
         w.record(*rec)
         count += 1
 
@@ -245,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             w.field(fname, ftype, size=fsize, decimal=fdec)
         # source field: filename stem, up to 80 chars
         w.field("source", "C", size=80)
+        w.field("direction", "C", size=10)
 
         for filepath in json_files:
             try:
@@ -262,8 +275,9 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             source_name = filepath.stem
+            direction = _detect_direction(filepath.name)
             try:
-                count = append_to_writer(w, doc, source_name, attr_fields)
+                count = append_to_writer(w, doc, source_name, direction, attr_fields)
             except Exception as exc:
                 msg = f"{filepath}: conversion failed — {exc}"
                 failures.append(msg)
