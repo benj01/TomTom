@@ -10,14 +10,17 @@ Requirements:
     pip install pyshp
 
 Usage examples:
-    # Convert a single file
+    # Convert a single file to its own shapefile
     python json_to_shapefile.py --input_file data.json --output_dir ./shapefiles
 
-    # Batch-convert all JSON files in a folder
+    # Batch-convert: one shapefile per JSON file
     python json_to_shapefile.py --input_dir ./data --output_dir ./shapefiles
 
-    # Include trips_pct if present (e.g. after running normalize_trips.py)
-    python json_to_shapefile.py --input_dir ./output --output_dir ./shapefiles
+    # Merge all files into a single shapefile (adds 'source' field)
+    python json_to_shapefile.py --input_dir ./data --output_dir ./shapefiles --merge
+
+    # Merged output with custom shapefile name
+    python json_to_shapefile.py --input_dir ./data --output_dir ./shapefiles --merge --merge_name aargau_all
 """
 
 from __future__ import annotations
@@ -76,70 +79,107 @@ def find_field_indices(node_format: list[str]) -> dict[str, int]:
     return {name.lower(): i for i, name in enumerate(node_format)}
 
 
-def convert_to_shapefile(doc: dict, output_path: Path) -> int:
-    """Convert a parsed JSON document to a shapefile.
-
-    Args:
-        doc: Parsed JSON with 'nodeFormat' and 'nodes'.
-        output_path: Path for the output .shp (without extension).
-
-    Returns:
-        Number of features written.
-    """
-    node_format = doc["nodeFormat"]
-    nodes = doc["nodes"]
-    field_map = find_field_indices(node_format)
-
-    # Determine which attribute fields to include (geometry is handled separately)
-    geom_idx = field_map.get("geometry")
-    attr_fields = []  # list of (lowercase_name, index, field_def)
+def _detect_attr_fields(field_map: dict[str, int]) -> list[tuple[str, int, tuple]]:
+    """Build ordered list of (lowercase_name, index, field_def) for attributes."""
+    attr_fields = []
     for lname, idx in field_map.items():
         if lname == "geometry":
             continue
         if lname in FIELD_DEFS:
             attr_fields.append((lname, idx, FIELD_DEFS[lname]))
+    return attr_fields
 
-    # Create the shapefile writer
+
+def _write_prj(output_path: Path) -> None:
+    """Write WGS 84 .prj sidecar."""
+    prj_path = output_path.with_suffix(".prj")
+    prj_path.write_text(WGS84_PRJ, encoding="utf-8")
+
+
+def convert_to_shapefile(doc: dict, output_path: Path) -> int:
+    """Convert a single JSON document to its own shapefile.
+
+    Returns number of features written.
+    """
+    node_format = doc["nodeFormat"]
+    nodes = doc["nodes"]
+    field_map = find_field_indices(node_format)
+
+    geom_idx = field_map.get("geometry")
+    attr_fields = _detect_attr_fields(field_map)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     w = shapefile.Writer(str(output_path))
     w.shapeType = shapefile.POLYLINE
     w.autoBalance = 1
 
-    # Define fields
     for _, _, (fname, ftype, fsize, fdec) in attr_fields:
         w.field(fname, ftype, size=fsize, decimal=fdec)
 
-    # Write features
     count = 0
     for node in nodes:
         coords = node[geom_idx] if geom_idx is not None else None
         if not coords or not isinstance(coords, list) or len(coords) < 2:
-            # Skip nodes without a valid polyline (need at least 2 points)
             continue
-
-        # pyshp expects polyline as a list of parts, each part a list of [x, y]
         w.line([coords])
-
-        # Build the attribute record in field order
-        rec = []
-        for lname, idx, _ in attr_fields:
-            val = node[idx]
-            rec.append(val if val is not None else None)
+        rec = [node[idx] if node[idx] is not None else None for _, idx, _ in attr_fields]
         w.record(*rec)
         count += 1
 
     w.close()
-
-    # Write .prj sidecar for WGS 84
-    prj_path = output_path.with_suffix(".prj")
-    prj_path.write_text(WGS84_PRJ, encoding="utf-8")
-
+    _write_prj(output_path)
     return count
 
 
-def write_json(path: Path, doc: dict, pretty: bool = False) -> None:
-    """Unused here but kept for API symmetry with normalize_trips."""
-    pass
+def _detect_direction(filename: str) -> str:
+    """Derive 'incoming', 'outgoing', or 'unknown' from the filename."""
+    lower = filename.lower()
+    if "_incoming_" in lower or lower.startswith("incoming"):
+        return "incoming"
+    if "_outgoing_" in lower or lower.startswith("outgoing"):
+        return "outgoing"
+    return "unknown"
+
+
+def append_to_writer(
+    w: shapefile.Writer,
+    doc: dict,
+    source_name: str,
+    direction: str,
+    attr_fields: list[tuple[str, int, tuple]],
+) -> int:
+    """Append all features from one document to a shared Writer.
+
+    Returns number of features appended.
+    """
+    field_map = find_field_indices(doc["nodeFormat"])
+    geom_idx = field_map.get("geometry")
+
+    # Build index mapping: for each target attr field, find index in this doc
+    doc_indices = {}
+    for lname, _target_idx, _ in attr_fields:
+        doc_indices[lname] = field_map.get(lname)
+
+    count = 0
+    for node in doc["nodes"]:
+        coords = node[geom_idx] if geom_idx is not None else None
+        if not coords or not isinstance(coords, list) or len(coords) < 2:
+            continue
+        w.line([coords])
+        rec = []
+        for lname, _, _ in attr_fields:
+            idx = doc_indices.get(lname)
+            if idx is not None:
+                val = node[idx]
+                rec.append(val if val is not None else None)
+            else:
+                rec.append(None)
+        rec.append(source_name)
+        rec.append(direction)
+        w.record(*rec)
+        count += 1
+
+    return count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +198,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output_dir", required=True, type=Path,
         help="Folder to write shapefiles.",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="Combine all input files into a single shapefile.",
+    )
+    parser.add_argument(
+        "--merge_name", type=str, default="merged",
+        help="Base name for the merged shapefile (default: 'merged').",
     )
     args = parser.parse_args(argv)
 
@@ -179,41 +227,111 @@ def main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
     total_features = 0
 
-    for filepath in json_files:
-        # Read
-        try:
-            doc = read_json(filepath)
-        except (json.JSONDecodeError, OSError) as exc:
-            msg = f"{filepath}: failed to read — {exc}"
-            failures.append(msg)
-            print(msg, file=sys.stderr)
-            continue
+    if args.merge:
+        # ── Merged mode: single shapefile for all files ──
+        # Peek at the first valid file to determine fields
+        first_doc = None
+        for filepath in json_files:
+            try:
+                doc = read_json(filepath)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if validate_doc(doc, filepath) is None:
+                first_doc = doc
+                break
 
-        # Validate
-        err = validate_doc(doc, filepath)
-        if err is not None:
-            failures.append(err)
-            print(err, file=sys.stderr)
-            continue
+        if first_doc is None:
+            print("Error: no valid JSON files found.", file=sys.stderr)
+            return 1
 
-        # Convert
-        stem = filepath.stem
-        output_path = args.output_dir / stem / stem
-        try:
-            count = convert_to_shapefile(doc, output_path)
-        except Exception as exc:
-            msg = f"{filepath}: conversion failed — {exc}"
-            failures.append(msg)
-            print(msg, file=sys.stderr)
-            continue
+        field_map = find_field_indices(first_doc["nodeFormat"])
+        attr_fields = _detect_attr_fields(field_map)
 
-        total_features += count
-        print(f"{filepath.name}: {count} features -> {output_path}.shp", file=sys.stderr)
+        output_path = args.output_dir / args.merge_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        w = shapefile.Writer(str(output_path))
+        w.shapeType = shapefile.POLYLINE
+        w.autoBalance = 1
 
-    # Summary
-    total = len(json_files)
-    ok = total - len(failures)
-    print(f"\nConverted {ok}/{total} file(s), {total_features} total features.", file=sys.stderr)
+        for _, _, (fname, ftype, fsize, fdec) in attr_fields:
+            w.field(fname, ftype, size=fsize, decimal=fdec)
+        # source field: filename stem, up to 80 chars
+        w.field("source", "C", size=80)
+        w.field("direction", "C", size=10)
+
+        for filepath in json_files:
+            try:
+                doc = read_json(filepath)
+            except (json.JSONDecodeError, OSError) as exc:
+                msg = f"{filepath}: failed to read — {exc}"
+                failures.append(msg)
+                print(msg, file=sys.stderr)
+                continue
+
+            err = validate_doc(doc, filepath)
+            if err is not None:
+                failures.append(err)
+                print(err, file=sys.stderr)
+                continue
+
+            source_name = filepath.stem
+            direction = _detect_direction(filepath.name)
+            try:
+                count = append_to_writer(w, doc, source_name, direction, attr_fields)
+            except Exception as exc:
+                msg = f"{filepath}: conversion failed — {exc}"
+                failures.append(msg)
+                print(msg, file=sys.stderr)
+                continue
+
+            total_features += count
+            print(f"{filepath.name}: {count} features", file=sys.stderr)
+
+        w.close()
+        _write_prj(output_path)
+
+        total = len(json_files)
+        ok = total - len(failures)
+        print(
+            f"\nMerged {ok}/{total} file(s) -> {output_path}.shp "
+            f"({total_features} features).",
+            file=sys.stderr,
+        )
+
+    else:
+        # ── Per-file mode: one shapefile per JSON file ──
+        for filepath in json_files:
+            try:
+                doc = read_json(filepath)
+            except (json.JSONDecodeError, OSError) as exc:
+                msg = f"{filepath}: failed to read — {exc}"
+                failures.append(msg)
+                print(msg, file=sys.stderr)
+                continue
+
+            err = validate_doc(doc, filepath)
+            if err is not None:
+                failures.append(err)
+                print(err, file=sys.stderr)
+                continue
+
+            stem = filepath.stem
+            output_path = args.output_dir / stem / stem
+            try:
+                count = convert_to_shapefile(doc, output_path)
+            except Exception as exc:
+                msg = f"{filepath}: conversion failed — {exc}"
+                failures.append(msg)
+                print(msg, file=sys.stderr)
+                continue
+
+            total_features += count
+            print(f"{filepath.name}: {count} features -> {output_path}.shp", file=sys.stderr)
+
+        total = len(json_files)
+        ok = total - len(failures)
+        print(f"\nConverted {ok}/{total} file(s), {total_features} total features.", file=sys.stderr)
+
     if failures:
         print(f"\n{len(failures)} failure(s):", file=sys.stderr)
         for msg in failures:
